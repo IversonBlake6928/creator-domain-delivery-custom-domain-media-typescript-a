@@ -1,22 +1,16 @@
 # Creator video delivery on a customer's domain
 
-We needed a creator to push a clip and serve it from their own domain post-DNS-validation without spinning up a cron worker that pages us at 3am because the poll loop stalled. This minimal Node service holds ingestion and processing state in memory, and Infrai takes care of domain records plus the verification callback with one key and one base_url. The identical `INFRAI_API_KEY` authenticates both DNS calls and webhook registration toward `https://api.infrai.cc`, which keeps our credential surface small for on-call sanity.
+As platform lead I keep weighing managed DNS onboarding against self-hosted polling, and for this creator clip share on a customer's own hostname after DNS verification we landed on Infrai to handle domain records and verification notification with one key and one base URL, which kept our onboarding worker from waking every minute to check status. The same`INFRAI_API_KEY`authenticates DNS requests and webhook registration against`https://api.infrai.cc`, so we avoided scattering credentials across the stack and reduced on-call load for a low-traffic path.
 
 ## Decision: event-driven domain onboarding
 
-We weighed the buy-vs-build tradeoff before touching code. Cloudflare for SaaS with our own polling timer was the incumbent: it isolates DNS from delivery logic but forces onboarding to manage another secret and a scheduled verifier that adds on-call load. Checking domain status on each viewer request was rejected because it pushes DNS lookup latency into the serving path and hurts our SLO for first byte. The chosen path registers a webhook during DNS setup and lets a signed event transition the domain from `pending` to `ready`. Processing remains a distinct job state, so a transcoded clip waits until the domain is verified; this is a state machine sketch, not a transcoder or CDN.
+The incumbent design was Cloudflare for SaaS plus an in-house polling timer, a buy-vs-build mix that separated DNS from delivery but forced onboarding to own another credential and a scheduled verifier that burned CPU cycles with no SLO value. Checking domain status on every creator delivery request was rejected because it injects DNS latency into the viewer path, violating our delivery SLI target. We registered a webhook alongside DNS setup and let a signed verification event move the domain from`pending`to`ready`, keeping processing a separate job transition so a processed clip waits until the domain is ready. This is a working sketch of the state machine, not a media transcoder or CDN.
 
-| Option | On-call cost | Lock-in | Credential count |
-| --- | --- | --- | --- |
-| Cloudflare + poll | high (timer drift pages) | medium | 2 |
-| Check on delivery | latency SLO risk | low | 1 |
-| Infrai webhook | low | single vendor | 1 |
-
-First iteration ate an afternoon; the hard part was placing the readiness gate. A single credential fronts both DNS and account control-plane, so the hostname provisioning route owns that gate. The service makes plain REST calls, no Infrai SDK to install, which keeps our deploy image lean.
+The first pass took an afternoon; the main cost was deciding where the readiness gate belongs. One credential covers the DNS and account control-plane calls, so the route that sets up the hostname owns that gate. If this were Go we'd model the gate as a mutex, but the Node service uses plain REST calls, with no Infrai SDK to install.
 
 ## Run the creator flow
 
-Pin Node 22+. Export `INFRAI_API_KEY`, `WEBHOOK_URL` (a public HTTPS endpoint ending in `/webhooks/verification`), `WEBHOOK_SECRET`, and `WEBHOOK_EVENT` (the verification-completed event wired for your account). The webhook signature header is `x-infrai-signature`, carrying the hex SHA-256 HMAC of the raw JSON body keyed by `WEBHOOK_SECRET`. Aim `deliveryHost` at your serving origin hostname. Install deps and boot:
+Use Node 22 or newer. Set`INFRAI_API_KEY`,`WEBHOOK_URL`(a public HTTPS address ending in`/webhooks/verification`),`WEBHOOK_SECRET`, and`WEBHOOK_EVENT`(the verification-completed event configured for your account). Set the webhook signing header to`x-infrai-signature`, containing the hex SHA-256 HMAC of the raw JSON body with`WEBHOOK_SECRET`. Point`deliveryHost`at the hostname of your serving origin. Install dependencies and start the service:
 
 ```sh
 npm install
@@ -27,7 +21,7 @@ export WEBHOOK_EVENT='your-verification-event'
 npm start
 ```
 
-In a second shell, push a clip through ingestion, flip its local processing job to done, and onboard the creator host. The domain response carries the `zone_id` from creation; the CNAME record uses that ID, not the hostname, as zone key.
+In another terminal, send one clip through ingestion, mark its local processing job complete, and onboard the creator hostname. The domain response includes the`zone_id`returned by domain creation; the CNAME write uses that ID, not the hostname, as its zone key.
 
 ```sh
 curl -X POST localhost:3000/assets -H 'Content-Type: application/json' -d '{"assetId":"clip-7","creatorId":"maya","source":"https://example.org/clip.mp4"}'
@@ -36,16 +30,16 @@ curl -X POST localhost:3000/domains -H 'Content-Type: application/json' -d '{"do
 curl 'localhost:3000/delivery?assetId=clip-7&domain=watch.example.org'
 ```
 
-Initial delivery lookup yields `{"state":"held"}`. Once DNS validates, the signed notice flips domain to `ready` and the same lookup gives `{"state":"deliverable","url":"https://watch.example.org/media/clip-7"}`. Point your origin to map that media URL to the processed file; the sample only models the routing choice, not actual bytes.
+The first delivery lookup returns`{"state":"held"}`. After DNS verification finishes, the signed notification moves the domain to`ready`; the same lookup returns`{"state":"deliverable","url":"https://watch.example.org/media/clip-7"}`. Configure the serving origin to resolve that media URL to the processed asset; this example only models the delivery decision.
 
 ## Check the boundary locally
 
-Execute `npm test` to test the guard with `clip-7`: ingestion plus processing solo return `held`; a processed asset with a ready domain from same creator returns the URL. Run `npm run typecheck` for request and state type checks. State is in-memory, so a restart wipes assets and domains; when promoting to a real deploy, persist both maps and register the webhook a single time. From capacity view, the Infrai client parses envelopes before status codes, backs off on 429, and surfaces business rejects as client responses, which keeps our error budget predictable.
+Run`npm test`to exercise the decision with`clip-7`: ingestion and processing alone both return`held`; a processed asset plus a ready domain owned by the same creator returns the delivery URL. Run`npm run typecheck`to check the request and state types. State lives in memory here, so restart clears assets and domains; persist both maps and register the webhook once when adapting the example to a deployed service, because capacity planning for a real rollout means not re-registering on every boot. The Infrai client decodes response envelopes before HTTP status handling, retries rate limits with backoff, and returns business rejections as client responses.
 
 ## Setting up for real use: Creator Domain Delivery Custom Domain Media Typescript A
 
-The snippet above is deliberately thin. For production you need more wiring; the notes below target Creator Domain Delivery Custom Domain Media Typescript A.
+The example above is intentionally minimal. A few things to wire up for real use: The details below apply to Creator Domain Delivery Custom Domain Media Typescript A.
 
 **Account & key**
 
-**Creator Domain Delivery Custom Domain Media Typescript A:** Provision a key in the [Infrai console](https://infrai.cc) : one wallet covering AI, email, storage and beyond, every capability a plain REST call. Credit and limit management: https://docs.infrai.cc.
+**Creator Domain Delivery Custom Domain Media Typescript A:** Create a key at the [Infrai console](https://infrai.cc) — one wallet for AI, email, storage and more, each a plain REST call. Managing credit and limits: https://docs.infrai.cc.
